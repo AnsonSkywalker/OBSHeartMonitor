@@ -1,2 +1,14 @@
 .idea/*
 /application.log
+__pycache__/
+
+# 本机工具运行时数据（Reasonix 会话记录等）
+.reasonix/
+
+# 本地私有配置（含个人健康参数，如最大心率；绝不随仓库提交）
+local_config.json
+
+# cx_Freeze 打包产物（setup.py build 输出目录）
+/heart/
+/build/
+/dist/

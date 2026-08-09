@@ -1,131 +1,176 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
-    <!-- 生产环境版本，优化了尺寸和速度 -->
-    <script src="../static/js/vue.js"></script>
-    <!--<script src="https://cdn.jsdelivr.net/npm/vue@2"></script>-->
-    <!-- 引入样式 -->
-    <link rel="stylesheet" href="../static/element-ui/lib/theme-chalk/index.css" type="text/css">
-    <link rel="stylesheet" href="../static/style.css" type="text/css">
-    <!-- 引入组件库 -->
-    <script src="../static/element-ui/lib/index.js"></script>
+    <title>OBS 心率叠加层</title>
+    <style>
+        /*
+         * 视口适配说明（解决 OBS 浏览器源"刷新错位"问题）：
+         * OBS 浏览器源会对"文档尺寸超过视口"的页面做缩放处理(zoom)，
+         * 初始加载与刷新时 zoom 计算时序不一致，导致数字位置跑偏且越刷越偏。
+         * 因此这里强制 html/body 尺寸 == 视口(100%) + overflow hidden，
+         * 使 OBS 不介入缩放，内容用 fixed 钉在左上角。
+         */
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: transparent;
+        }
 
-    <script src="../static/js/moment.js"></script>
-    <!--    <script src="../static/js/axios/dist/axios.js"></script>-->
-    <script src="../static/js/axios.js"></script>
-    <!--<script src="../static/js/jquery.min.js"></script>-->
+        #app {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #heartNum {
+            /* inline-block：消除 inline 元素基线对齐导致的上下错位 */
+            display: inline-block;
+            font-size: 64px;
+            font-weight: bold;
+            line-height: 1;
+            /* 黑体优先，回退到微软雅黑；SimHei 无斜体变体，不设置 font-style */
+            font-family: "SimHei", "黑体", "Microsoft YaHei", sans-serif;
+            /* 底部投影阴影（向右下偏移的实色投影，非外发光/描边），保证叠加在视频画面上可读 */
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.85);
+            user-select: none;
+        }
+    </style>
+    <script src="../static/js/vue.js"></script>
 </head>
 <body>
-<div id="app" style="height: 200px; width: 1000px">
-
-    <div class="heart"></div>
-    <div class="num">
-        <!--为了区别flask的模板语法和vue.js的不同 设置标记，否则vue的不生效-->
-        {% raw %}
-        <span style=" font-size: 30px; font-weight: bold; color: red ; float: left; margin-left: 5px;vertical-align: top;">
-            {{heartNum}}
-        </span>
-        <!--<span style="margin-left: 10px; vertical-align: -4px">次 /分</span>-->
-        <span style="margin-left: 10px; vertical-align: -4px; font-size: 30px;"><i class="el-icon-caret-top"
-                                                                                   style="color: red"></i></span>
-        <span style="vertical-align: -4px; font-size: 30px; font-weight: bold; color: yellow">{{maxHeartNum}}</span>
-        <span style="margin-left: 10px; vertical-align: -4px; font-size: 30px;"><i class="el-icon-caret-bottom"
-                                                                                   style="color: darkgrey"></i></span>
-        <span style="vertical-align: -4px; font-size: 30px; font-weight: bold; color: lightseagreen">{{minHeartNum}}</span>
-        {% endraw %}
-    </div>
+<div id="app">
+    <span id="heartNum" :style="{ color: heartColor }">{% raw %}{{ displayNum }}{% endraw %}</span>
 </div>
-</body>
 <script>
+    // ============================================================
+    // 心率区间颜色关键帧（按最大心率的百分比）
+    // percent: 占最大心率的百分比；color: 该关键帧的颜色（十六进制）
+    // 关键帧取各区间中点：热身 55%、燃脂 65.5%、有氧 75.5%、
+    // 无氧 85.5%、极限 95.5%（91% 以上无上界，取 91~100 中点）
+    // 两个关键帧之间的百分比按线性插值平滑过渡，实现"逐渐变色"；
+    // 低于首个关键帧显示首个关键帧颜色，高于末个关键帧显示末个关键帧颜色
+    // ============================================================
+    const HEART_RATE_ZONE_STOPS = [
+        {percent: 55,   color: '#44B4FE'},  // 热身 50%-60% 中点：天蓝
+        {percent: 65.5, color: '#36D06E'},  // 燃脂 61%-70% 中点：绿
+        {percent: 75.5, color: '#FFBB00'},  // 有氧 71%-80% 中点：橙
+        {percent: 85.5, color: '#FF8A06'},  // 无氧 81%-90% 中点：深橙
+        {percent: 95.5, color: '#F65D5C'},  // 极限 91%+ 中点：深红
+    ];
+
+    // 十六进制颜色转 [r, g, b]
+    function hexToRgb(hex) {
+        const n = parseInt(hex.slice(1), 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+
+    // 两个颜色之间按比例 t (0~1) 线性插值
+    function lerpColor(c1, c2, t) {
+        return 'rgb(' + c1.map(function (v, i) {
+            return Math.round(v + (c2[i] - v) * t);
+        }).join(', ') + ')';
+    }
+
+    // 根据心率值(次/分)与最大心率计算渐变颜色
+    function colorForHeartRate(value, maxHeartRate) {
+        const stops = HEART_RATE_ZONE_STOPS;
+        const percent = value / maxHeartRate * 100;
+        if (percent <= stops[0].percent) return stops[0].color;
+        for (let i = 1; i < stops.length; i++) {
+            if (percent <= stops[i].percent) {
+                const a = stops[i - 1];
+                const b = stops[i];
+                const t = (percent - a.percent) / (b.percent - a.percent);
+                return lerpColor(hexToRgb(a.color), hexToRgb(b.color), t);
+            }
+        }
+        return stops[stops.length - 1].color;
+    }
+
     const app = new Vue({
         el: '#app',
         data: {
-            loading: false,
-            heartNum: 0, // 当前心跳值
-            maxHeartNum: 0,
-            minHeartNum: 0,
-            timer: null,
-            port: 8888,
-
+            heartNum: null,      // 当前心率（null = 尚未收到有效数据）
+            maxHeartRate: 180,   // 最大心率（默认 180；由 /config 本地私有配置覆盖）
+            ws: null,
+            reconnectTimer: null,
+            destroyed: false,    // 页面卸载标记，防止卸载后重建重连
+        },
+        computed: {
+            displayNum: function () {
+                return this.heartNum === null ? '--' : String(this.heartNum);
+            },
+            heartColor: function () {
+                if (this.heartNum === null) return '#9E9E9E';  // 无数据时灰色
+                return colorForHeartRate(this.heartNum, this.maxHeartRate);
+            },
         },
         methods: {
-            getHeartInfo() {
-                axios.get(`http://localhost:` + this.port + `/getHeartNum`).then(res => {
-                    console.log(res.data)
-                    if (res.data !== null) {
-                        this.heartNum = res.data.value;
-                        this.maxHeartNum = res.data.maxValue;
-                        this.minHeartNum = res.data.minValue;
+            connectWebSocketServer: function () {
+                const that = this;
+                // WebSocket 服务端口固定 8000（heart.py 启动时监听）
+                this.ws = new WebSocket('ws://localhost:8000');
+
+                this.ws.onopen = function () {
+                    console.log('OBS 心率叠加层：WebSocket 已连接');
+                    // 发送任意消息触发服务端开始推送
+                    that.ws.send('heart-overlay');
+                };
+
+                this.ws.onmessage = function (e) {
+                    let result;
+                    try {
+                        result = JSON.parse(e.data);
+                    } catch (err) {
+                        console.warn('OBS 心率叠加层：收到非 JSON 消息，已跳过', e.data);
+                        return;
+                    }
+                    // value > 0 才算有效心率：蓝牙未连接时服务端推送缓存初值 0，应视为无数据
+                    if (result && typeof result.value === 'number' && result.value > 0) {
+                        that.heartNum = result.value;
+                    }
+                };
+
+                this.ws.onclose = function () {
+                    console.log('OBS 心率叠加层：WebSocket 已断开，3 秒后重连');
+                    // 自动重连：先开 OBS 后开软件也能收到数据；页面已卸载则不重连
+                    if (!that.destroyed) {
+                        that.reconnectTimer = setTimeout(that.connectWebSocketServer, 3000);
+                    }
+                };
+
+                this.ws.onerror = function (e) {
+                    console.log('OBS 心率叠加层：WebSocket 连接失败', e);
+                };
+
+                window.onbeforeunload = function () {
+                    that.destroyed = true;
+                    if (that.ws) that.ws.close();
+                    if (that.reconnectTimer) clearTimeout(that.reconnectTimer);
+                };
+            },
+        },
+        mounted: function () {
+            const that = this;
+            // 读取最大心率本地私有配置（/config 由 fastApi.py 提供）；
+            // 缺失或异常时保持默认值 180
+            fetch('/config')
+                .then(function (res) { return res.json(); })
+                .then(function (cfg) {
+                    if (cfg && typeof cfg.maxHeartRate === 'number' && cfg.maxHeartRate > 0) {
+                        that.maxHeartRate = cfg.maxHeartRate;
                     }
                 })
-            },
-            getConfig() {
-                const that = this
-                $.getJSON("setting.json", function (data) {
-                    //data 代表读取到的json中的数据
-                    console.log("===> data：", JSON.stringify(data))
-                    debugger
-                    if (data !== null && data !== undefined) {
-                        if (data.hasOwnProperty('port') && data.port !== "") {
-                            that.port = data.port
-                        }
-                    }
-                });
-            },
-            connectWebSocketServer() {
-                // WebSocket构造函数，创建WebSocket对象
-                const that = this
-                let ws = new WebSocket('ws://localhost:8000')
-                console.log(this.heartNum)
-                // 连接成功后的回调函数
-                ws.onopen = function (params) {
-                    console.log('客户端连接成功')
-                    // 向服务器发送消息
-                    ws.send('Hello,WebSocketServer!')
-                };
-
-                // 从服务器接受到信息时的回调函数
-                ws.onmessage = function (e) {
-                    console.log('收到服务器响应', e.data)
-                    result = JSON.parse(e.data)
-                    that.heartNum = result.value;
-                    that.maxHeartNum = result.maxValue;
-                    that.minHeartNum = result.minValue;
-                };
-
-                // 连接关闭后的回调函数
-                ws.onclose = function (evt) {
-                    console.log("关闭客户端连接");
-                };
-
-                // 连接失败后的回调函数
-                ws.onerror = function (evt) {
-                    console.log("连接失败了");
-                };
-
-
-                // 监听窗口关闭事件，当窗口关闭时，主动去关闭websocket连接，防止连接还没断开就关闭窗口，这样服务端会抛异常。
-                window.onbeforeunload = function () {
-                    ws.close();
-                }
-
-            },
+                .catch(function () { /* 保持默认 180 */ });
+            this.connectWebSocketServer();
         },
-        created() {
-            //this.getConfig();
-            this.timer = setInterval(() => {
-                //this.getHeartInfo();
-            }, 1000);
-        },
-        mounted() {
-            setTimeout(() => {
-                this.connectWebSocketServer();
-            }, 1000)
-
-        }
     });
 </script>
+</body>
 </html>
