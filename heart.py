@@ -34,8 +34,8 @@ logger.add("application.log", rotation="50MB", encoding="utf-8", enqueue=True, l
 # 设备的Characteristic UUID
 par_notification_characteristic = "00002a37-0000-1000-8000-00805f9b34fb"
 # par_notification_characteristic = "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
-# 设备的MAC地址
-# device_address = "C8:06:E2:3C:E1:91"
+# 设备的MAC地址（示例，请替换为实际设备地址）
+# device_address = "XX:XX:XX:XX:XX:XX"
 device_address = ""
 
 
