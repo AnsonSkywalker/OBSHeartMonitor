@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import sys
 from types import FrameType
@@ -49,8 +50,10 @@ async def get_config():
             with open(_CONFIG_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             # 白名单：只取 maxHeartRate，避免未来加入的其他本地字段经 HTTP 暴露
+            # math.isfinite 排除 JSON 允许的 Infinity/NaN（int(inf) 会抛 OverflowError）
             mhr = data.get("maxHeartRate") if isinstance(data, dict) else None
-            if isinstance(mhr, (int, float)) and not isinstance(mhr, bool) and mhr > 0:
+            if (isinstance(mhr, (int, float)) and not isinstance(mhr, bool)
+                    and math.isfinite(mhr) and mhr > 0):
                 max_heart_rate = int(mhr)
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             logger.warning("local_config.json 读取失败，使用默认配置")

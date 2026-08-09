@@ -131,9 +131,10 @@
                         console.warn('OBS 心率叠加层：收到非 JSON 消息，已跳过', e.data);
                         return;
                     }
-                    // value > 0 才算有效心率：蓝牙未连接时服务端推送缓存初值 0，应视为无数据
-                    if (result && typeof result.value === 'number' && result.value > 0) {
-                        that.heartNum = result.value;
+                    // value > 0 才算有效心率；蓝牙未连接/软件重启时服务端推送缓存初值 0，
+                    // 此时回退 null 显示 '--'，避免冻结最后一个有效心率
+                    if (result && typeof result.value === 'number') {
+                        that.heartNum = result.value > 0 ? result.value : null;
                     }
                 };
 
