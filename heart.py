@@ -41,6 +41,9 @@ battery_characteristic = "00002a19-0000-1000-8000-00805f9b34fb"
 # device_address = "XX:XX:XX:XX:XX:XX"
 device_address = ""
 
+# 蓝牙连接线程（模块级初始化，避免未连接时引用报错）
+thread1 = None
+
 # 前端JS执行通道：bluetooth/websocket 等子线程不能直接调用 Qt 的 runJavaScript，
 # 统一通过 CallHandler.js_notify 信号排队到 GUI 线程执行
 js_handler = None
@@ -129,7 +132,12 @@ async def notification_handler(characteristic: BleakGATTCharacteristic, data: by
     #
     #     1.\x06 对应的十进制值是 6。 暂时不知道这个值有啥用
     #     2.\x54 对应的十进制值是 84。  心跳的值， T 的ascii 的十六进制是54
-    value = int(data.hex().split('06')[1], 16);
+    raw = data.hex()
+    marker = raw.find('06')
+    if marker == -1 or marker + 2 >= len(raw):
+        logger.warning(f"无法解析的心跳数据: {raw}")
+        return None
+    value = int(raw[marker + 2:], 16)
     cache.set('value', value)
     maxValue = cache.get('maxValue')
     minValue = cache.get('minValue')
@@ -199,6 +207,11 @@ class CallHandler(QObject):
         device_address = words[0];
         logger.info('thread %s is running...' % threading.current_thread().name)
         global thread1
+        # 若旧连接线程仍在运行（如正在重连中），先通知其停止，避免产生孤儿重连线程
+        if thread1 is not None and thread1.is_alive():
+            logger.info("已有蓝牙线程在运行，先停止旧线程")
+            thread1.stop_event.set()
+            thread1.join(timeout=2)  # 正常路径 0.2s 内退出；缩短新旧线程并发窗口
         logger.info(f'device_address is {device_address}, uuid is {uuid}')
         thread1 = myThread(1, "Thread-1", 0, device_address, uuid);
         try:
@@ -214,22 +227,30 @@ class CallHandler(QObject):
     @pyqtSlot(str)
     def disconnectBluetooth(self, str_args):
         global thread1
-        try:
-            thread1.stop_event.set()
-            # 在蓝牙线程的事件循环里主动断开，让线程干净退出；超时则强制停止兜底
-            if thread1.loop is not None and thread1.client is not None:
-                try:
-                    fut = asyncio.run_coroutine_threadsafe(thread1.client.disconnect(), thread1.loop)
-                    fut.result(timeout=5)
-                except Exception as e:
-                    logger.error(f"disconnect error: {e}")
-            thread1.join(timeout=5)
-            if thread1.is_alive():
-                stop_thread(thread1)
-        except (RuntimeError, TypeError, NameError, SystemExit, Exception) as e:
-            logger.error(f"An error occurred: {e}")
-        info = 'true'
-        view.page().runJavaScript("window.stopConnect('%s')" % info)
+        # 断开流程放到后台线程执行，避免主线程阻塞导致前端无响应；
+        # stop_event 置位后蓝牙线程会在轮询间隔内自行退出并断开连接。
+        def _do_stop():
+            t = thread1  # 快照：断开期间用户可能重新连接，避免误停新线程
+            if t is None:
+                logger.warning("未连接蓝牙设备，无需断开")
+                push_js("window.stopConnect('true')")
+                return
+            try:
+                t.stop_event.set()
+                t.join(timeout=10)  # 线程可能正处于扫描/连接中，最多等其自然退出
+                if t.is_alive():
+                    logger.warning("蓝牙线程未及时退出，先请求断开再强制停止")
+                    if t.loop is not None and t.client is not None:
+                        try:
+                            fut = asyncio.run_coroutine_threadsafe(t.client.disconnect(), t.loop)
+                            fut.result(timeout=2)  # 给 winrt 后台 2s 完成断开，减少句柄残留
+                        except Exception:
+                            pass
+                    stop_thread(t)
+            except (SystemExit, Exception) as e:
+                logger.error(f"An error occurred: {e}")
+            push_js("window.stopConnect('true')")
+        threading.Thread(target=_do_stop, daemon=True, name="bt-stop").start()
 
     @pyqtSlot(result=int)
     def getHeartNum(self):
@@ -262,7 +283,7 @@ class CallHandler(QObject):
         try:
             stop_thread(server)
             # server.terminate()
-        except (RuntimeError, TypeError, NameError, SystemExit, Exception) as e:
+        except (SystemExit, Exception) as e:
             logger.error(f"An error occurred: {e}")
         # server.terminate()
         info = 'true'
@@ -279,7 +300,8 @@ class CallHandler(QObject):
                 bluetooth_info = {"address": key, "name": value}
                 list.append(bluetooth_info)
             logger.info(f"list: {list}")
-            view.page().runJavaScript("window.initSearch('%s')" % json.dumps(list))
+            # \u0027 转义单引号：设备名来自 BLE 广播，防止恶意名称闭合 JS 字符串注入
+            view.page().runJavaScript("window.initSearch('%s')" % json.dumps(list).replace("'", "\\u0027"))
 
     @pyqtSlot(str)
     def onSubmitConfig(self, data):
@@ -382,10 +404,13 @@ class mySearchThread(threading.Thread):
 # 开启另一个线程去连接蓝牙 实时获取心跳值
 class myThread(threading.Thread):
     d_address = ""
-    max_reconnect_delay = 30  # 自动重连的退避间隔上限（秒）
+    max_reconnect_delay = 30      # 自动重连的退避间隔上限（秒）
+    connect_timeout = 15          # 建立 BLE 连接的超时（秒）
+    keepalive_interval = 60       # 保活读取间隔（秒）
+    keepalive_read_timeout = 10   # 保活读取超时（秒）
 
     def __init__(self, threadID, name, delay, bluetoothAdresss, uuid):
-        threading.Thread.__init__(self)
+        threading.Thread.__init__(self, daemon=True)
         self.threadID = threadID
         self.name = name
         self.delay = delay
@@ -442,13 +467,16 @@ class myThread(threading.Thread):
     async def connectOnce(self, device_address, uuid):
         logger.info(f'bluetooth device {device_address} uuid is {uuid} start connecting...')
         # 基于MAC地址查找设备（记录扫描耗时与信号强度，重连慢时可对照）
+        if self.stop_event.is_set():
+            logger.info("用户已停止，跳过本次扫描")
+            return None
         scan_start = time.time()
         try:
             device = await BleakScanner.find_device_by_address(
-                device_address, cb=dict(use_bdaddr=False)  # use_bdaddr判断是否是MOC系统
+                device_address, timeout=8, cb=dict(use_bdaddr=False)  # use_bdaddr判断是否是MOC系统
             )
         except Exception as e:
-            logger.error(f"扫描设备异常: {e}")
+            logger.error(f"扫描设备异常: {type(e).__name__}: {e}")
             return None
         scan_cost = time.time() - scan_start
         if device is None:
@@ -461,10 +489,11 @@ class myThread(threading.Thread):
         # 事件定义
         disconnected_event = asyncio.Event()
         conn_started = None
+        reconnecting_notified = False  # 同一连接只向前端推送一次 reconnecting
 
         # 断开连接事件回调，当设备断开连接时，会触发该函数，存在一定延迟
         def disconnected_callback(client):
-            nonlocal conn_started
+            nonlocal conn_started, reconnecting_notified
             if self.stop_event.is_set():
                 logger.info("用户主动停止，断开连接")
                 disconnected_event.set()
@@ -474,17 +503,50 @@ class myThread(threading.Thread):
             hb_ago_txt = f"{hb_ago:.0f}s" if hb_ago is not None else "从未收到"
             logger.warning(f"Disconnected callback called! 连接时长: {elapsed:.0f}s, 距最后心跳: {hb_ago_txt}, "
                            f"累计心跳: {heartbeat_count} 次, 进入自动重连...")
-            push_js("window.getConnectInfo('reconnecting')")
+            if not reconnecting_notified:
+                reconnecting_notified = True
+                push_js("window.getConnectInfo('reconnecting')")
             disconnected_event.set()
 
         logger.info("connecting to device...")
+        if self.stop_event.is_set():
+            # 扫描期间用户可能已停止，不再发起连接
+            logger.info("用户已停止，跳过连接")
+            return None
+        connect_start = time.time()
         try:
-            connect_start = time.time()
-            async with BleakClient(device, disconnected_callback=disconnected_callback,
-                                   winrt=dict(use_cached_services=False)) as client:
-                self.client = client
-                conn_started = time.time()
-                logger.info(f"Connected（建立连接耗时 {conn_started - connect_start:.1f}s）")
+            # 重连时使用 Windows 缓存的服务列表，跳过重新发现以加快重连、减少失败点
+            client = BleakClient(device, disconnected_callback=disconnected_callback,
+                                 winrt=dict(use_cached_services=self.ever_connected))
+        except Exception as e:
+            logger.error(f"创建 BleakClient 失败: {type(e).__name__}: {e}")
+            return None
+        self.client = client  # 立即赋值：连接建立前被停止流程引用（用于强杀前请求断开）
+        try:
+            try:
+                await asyncio.wait_for(client.connect(), timeout=self.connect_timeout)
+            except asyncio.TimeoutError:
+                logger.error(f"连接超时（{self.connect_timeout}s 无响应）")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return None
+            except Exception as e:
+                logger.error(f"连接失败: {type(e).__name__}: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return None
+            # 连接已建立：手动管理生命周期（bleak 的 __aenter__ 会无条件再次 connect，避免双重连接）
+            conn_started = time.time()
+            logger.info(f"Connected（建立连接耗时 {conn_started - connect_start:.1f}s）")
+            try:
+                if self.stop_event.is_set():
+                    # 连接建立期间用户已停止/发起了新连接，立即断开退出
+                    logger.info("连接建立后用户已停止，立即断开退出")
+                    return 0
                 # 枚举服务，并顺带确认是否支持电量特征（用于保活）
                 battery_uuid = None
                 for service in client.services.services.values():
@@ -504,6 +566,10 @@ class myThread(threading.Thread):
                 notify_start = time.time()
                 await client.start_notify(uuid, notification_handler)
                 logger.info(f"start_notify 完成（耗时 {time.time() - notify_start:.1f}s）")
+                if self.stop_event.is_set():
+                    # 订阅期间用户已停止/发起了新连接，不推送成功通知，直接断开退出
+                    logger.info("订阅完成但用户已停止，立即断开退出")
+                    return 0
                 # 通知前端：首次连接成功 / 自动重连成功
                 if self.ever_connected:
                     push_js("window.getConnectInfo('reconnected')")
@@ -514,7 +580,10 @@ class myThread(threading.Thread):
                 # 保活：周期读取电量特征维持链路活跃，读失败则主动断开触发重连
                 keepalive_task = None
                 if battery_uuid is not None:
-                    keepalive_task = asyncio.ensure_future(self.keepalive(client, battery_uuid))
+                    keepalive_task = asyncio.ensure_future(
+                        self.keepalive(client, battery_uuid,
+                                       interval=self.keepalive_interval,
+                                       read_timeout=self.keepalive_read_timeout))
 
                 # 等待：设备断开 / 用户主动停止（监听直到断开为止，有延迟）
                 stop_waiter = asyncio.ensure_future(self._wait_stop())
@@ -522,21 +591,29 @@ class myThread(threading.Thread):
                     {asyncio.ensure_future(disconnected_event.wait()), stop_waiter},
                     return_when=asyncio.FIRST_COMPLETED
                 )
-                for task in pending:
-                    task.cancel()
+                canceled = list(pending)
                 if keepalive_task is not None:
-                    keepalive_task.cancel()
+                    canceled.append(keepalive_task)
+                for task in canceled:
+                    task.cancel()
+                if canceled:
+                    await asyncio.gather(*canceled, return_exceptions=True)
                 return time.time() - conn_started  # 返回本次连接时长（秒）
+            finally:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+                except Exception:
+                    pass
         except Exception as e:
-            logger.error(f"连接过程异常: {e}")
+            logger.error(f"连接过程异常: {type(e).__name__}: {e}")
             return None
 
-    async def keepalive(self, client, battery_uuid, interval=60):
+    async def keepalive(self, client, battery_uuid, interval=60, read_timeout=10):
         """周期读取电量特征保活；读取超时/失败说明链路已失效，主动断开以触发自动重连"""
         while not self.stop_event.is_set():
             await asyncio.sleep(interval)
             try:
-                data = await asyncio.wait_for(client.read_gatt_char(battery_uuid), timeout=10)
+                data = await asyncio.wait_for(client.read_gatt_char(battery_uuid), timeout=read_timeout)
                 battery = data[0] if data else -1
                 logger.info(f"保活: 读取电量成功 = {battery}%")
             except asyncio.TimeoutError:
