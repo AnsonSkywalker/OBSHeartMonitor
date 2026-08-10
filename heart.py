@@ -14,11 +14,12 @@ import warnings
 from PyQt5 import QtGui
 from diskcache import Cache
 from PyQt5.QtWidgets import QApplication, QMessageBox
-from PyQt5.QtCore import QObject, pyqtSlot, QUrl, Qt
+from PyQt5.QtCore import QObject, pyqtSlot, pyqtSignal, QUrl, Qt
 from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 
 import asyncio
+import time
 import wmi
 
 from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic
@@ -34,9 +35,23 @@ logger.add("application.log", rotation="50MB", encoding="utf-8", enqueue=True, l
 # 设备的Characteristic UUID
 par_notification_characteristic = "00002a37-0000-1000-8000-00805f9b34fb"
 # par_notification_characteristic = "ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6"
+# 电量特征，用于连接保活（周期读取以维持链路活跃）
+battery_characteristic = "00002a19-0000-1000-8000-00805f9b34fb"
 # 设备的MAC地址（示例，请替换为实际设备地址）
 # device_address = "XX:XX:XX:XX:XX:XX"
 device_address = ""
+
+# 前端JS执行通道：bluetooth/websocket 等子线程不能直接调用 Qt 的 runJavaScript，
+# 统一通过 CallHandler.js_notify 信号排队到 GUI 线程执行
+js_handler = None
+
+
+def push_js(script):
+    global js_handler
+    if js_handler is not None:
+        js_handler.js_notify.emit(script)
+    else:
+        view.page().runJavaScript(script)
 
 
 def getSystemInfo():
@@ -95,8 +110,15 @@ async def searchBluetoothDevices():
 
 
 # 实时获取心跳值
+# 调试观测：记录最后心跳时间/累计次数，断连时用于判断链路何时停止上报
+last_heartbeat_time = None
+heartbeat_count = 0
+_heartbeat_stat_time = None
+_heartbeat_stat_count = 0
+
+
 async def notification_handler(characteristic: BleakGATTCharacteristic, data: bytearray):
-    global value
+    global value, last_heartbeat_time, heartbeat_count, _heartbeat_stat_time, _heartbeat_stat_count
 
     # print("rev data:", data)   # 读取到的数据 rev data: bytearray(b'\x06V')
     # print("rev data:", int.from_bytes(data))
@@ -122,13 +144,27 @@ async def notification_handler(characteristic: BleakGATTCharacteristic, data: by
         cache.set('minValue', value)
 
     # print('❤:', value)
-    view.page().runJavaScript("window.getHeartNum('%s')" % value)
+    now = time.time()
+    last_heartbeat_time = now
+    heartbeat_count += 1
+    # 每分钟输出一次心跳接收速率，观察断连前手环上报节奏是否变化
+    if _heartbeat_stat_time is None or now - _heartbeat_stat_time >= 60:
+        interval = now - _heartbeat_stat_time if _heartbeat_stat_time else 0
+        if interval > 0:
+            rate = (heartbeat_count - _heartbeat_stat_count) / interval
+            logger.info(f"心跳统计: {rate:.1f} 次/秒（近 {interval:.0f}s，累计 {heartbeat_count} 次）")
+        _heartbeat_stat_time = now
+        _heartbeat_stat_count = heartbeat_count
+
+    push_js("window.getHeartNum('%s')" % value)
     return value
     # print(data.decode('ascii'))
     # print(data)
 
 
 class CallHandler(QObject):
+    # 跨线程向前端页面推送 JS 代码的信号（子线程 emit，GUI 线程执行）
+    js_notify = pyqtSignal(str)
 
     def __init__(self):
         super(CallHandler, self).__init__()
@@ -175,9 +211,23 @@ class CallHandler(QObject):
             logger.info('----connectBluetooth---')
         # asyncio.run(self.startConnect(device_address))
 
-    @pyqtSlot()
-    def disconnectBluetooth(self):
-        stop_thread(thread1)
+    @pyqtSlot(str)
+    def disconnectBluetooth(self, str_args):
+        global thread1
+        try:
+            thread1.stop_event.set()
+            # 在蓝牙线程的事件循环里主动断开，让线程干净退出；超时则强制停止兜底
+            if thread1.loop is not None and thread1.client is not None:
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(thread1.client.disconnect(), thread1.loop)
+                    fut.result(timeout=5)
+                except Exception as e:
+                    logger.error(f"disconnect error: {e}")
+            thread1.join(timeout=5)
+            if thread1.is_alive():
+                stop_thread(thread1)
+        except (RuntimeError, TypeError, NameError, SystemExit, Exception) as e:
+            logger.error(f"An error occurred: {e}")
         info = 'true'
         view.page().runJavaScript("window.stopConnect('%s')" % info)
 
@@ -205,8 +255,8 @@ class CallHandler(QObject):
             # server.terminate()
             view.page().runJavaScript("window.startServer('%s')" % info)
 
-    @pyqtSlot()
-    def stopServer(self):
+    @pyqtSlot(str)
+    def stopServer(self, port):
         logger.info('----- stopServer -----')
         # myapp.exit()
         try:
@@ -219,8 +269,8 @@ class CallHandler(QObject):
         view.page().runJavaScript("window.stopServer('%s')" % info)
 
     # 调用js代码，将搜索到的蓝牙信息返回给前端
-    @pyqtSlot()
-    def getBlueInfo(self):
+    @pyqtSlot(str)
+    def getBlueInfo(self, str_args):
         list = []
         data = cache.get("dict")
         if data is not None:
@@ -331,7 +381,8 @@ class mySearchThread(threading.Thread):
 
 # 开启另一个线程去连接蓝牙 实时获取心跳值
 class myThread(threading.Thread):
-    d_address = "";
+    d_address = ""
+    max_reconnect_delay = 30  # 自动重连的退避间隔上限（秒）
 
     def __init__(self, threadID, name, delay, bluetoothAdresss, uuid):
         threading.Thread.__init__(self)
@@ -340,65 +391,168 @@ class myThread(threading.Thread):
         self.delay = delay
         self.d_address = bluetoothAdresss;
         self.uuid = uuid;
+        self.stop_event = threading.Event()  # 置位表示用户主动停止，不再重连
+        self.loop = None                     # 本线程的 asyncio 事件循环
+        self.client = None                   # 当前 BleakClient 实例
+        self.ever_connected = False          # 本次会话是否成功连接过（区分首次连接/自动重连）
 
     def run(self):
         logger.info('thread %s is running...' % threading.current_thread().name)
-        asyncio.run(self.startConnect(self.d_address, self.uuid))
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self.startConnect(self.d_address, self.uuid))
+        finally:
+            self.loop.close()
+            self.loop = None
 
     async def startConnect(self, device_address, uuid):
-        logger.info('thread %s is running...' % threading.current_thread().name)
+        reconnect_delay = 1  # 断连后的首次重连等待（秒），之后按 2、4、8... 退避，封顶 30s
+        attempt = 0  # 本次会话累计的连接尝试次数（含首次）
+        while not self.stop_event.is_set():
+            attempt += 1
+            logger.info(f"===== 连接尝试 #{attempt}（device={device_address}, uuid={uuid}）=====")
+            conn_seconds = await self.connectOnce(device_address, uuid)
+            if self.stop_event.is_set():
+                break
+            if conn_seconds is not None and conn_seconds >= 10:
+                # 正常使用中掉线：重置退避，尽快重连
+                reconnect_delay = 1
+                logger.warning(f"蓝牙连接已断开，{reconnect_delay}s 后尝试自动重连...")
+            elif conn_seconds is not None:
+                # 刚连上就掉：视为不稳定，按退避递增重试，避免反复轰炸
+                logger.warning(f"连接仅维持 {conn_seconds:.0f}s 即断开，{reconnect_delay}s 后重试...")
+            else:
+                logger.warning(f"蓝牙连接失败，{reconnect_delay}s 后重试...")
+            # 等待退避间隔；用户主动停止时会立刻唤醒退出
+            await self._wait_stop(timeout=reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, self.max_reconnect_delay)
+        logger.info("蓝牙连接线程退出（用户停止或会话结束）")
+
+    async def _wait_stop(self, timeout=None):
+        """等待用户停止事件；timeout 为 None 时无限等待，否则最多等 timeout 秒"""
+        waited = 0.0
+        while not self.stop_event.is_set():
+            if timeout is not None and waited >= timeout:
+                return False
+            await asyncio.sleep(0.2)
+            waited += 0.2
+        return True
+
+    async def connectOnce(self, device_address, uuid):
         logger.info(f'bluetooth device {device_address} uuid is {uuid} start connecting...')
-        # 基于MAC地址查找设备
-        device = await BleakScanner.find_device_by_address(
-            device_address, cb=dict(use_bdaddr=False)  # use_bdaddr判断是否是MOC系统
-        )
+        # 基于MAC地址查找设备（记录扫描耗时与信号强度，重连慢时可对照）
+        scan_start = time.time()
+        try:
+            device = await BleakScanner.find_device_by_address(
+                device_address, cb=dict(use_bdaddr=False)  # use_bdaddr判断是否是MOC系统
+            )
+        except Exception as e:
+            logger.error(f"扫描设备异常: {e}")
+            return None
+        scan_cost = time.time() - scan_start
         if device is None:
-            logger.error("could not find device with address '%s'", device_address)
-            info = 'false'
-            view.page().runJavaScript("window.getConnectInfo('%s')" % info)
-            return
+            logger.error(f"could not find device with address '{device_address}'（扫描耗时 {scan_cost:.1f}s）")
+            if not self.ever_connected:
+                push_js("window.getConnectInfo('false')")
+            return None
+        logger.info(f"已扫描到设备: name={getattr(device, 'name', '?')}, rssi={getattr(device, 'rssi', '?')}, 扫描耗时 {scan_cost:.1f}s")
 
         # 事件定义
         disconnected_event = asyncio.Event()
+        conn_started = None
 
         # 断开连接事件回调，当设备断开连接时，会触发该函数，存在一定延迟
         def disconnected_callback(client):
-            logger.error("Disconnected callback called!")
-            # 蓝牙连接成功将信息返回给前端
-            # 调用Js函数传参时必须要先声明变量再传参，直接传会报错
-            info = 'false'
-            view.page().runJavaScript("window.getConnectInfo('%s')" % info)
+            nonlocal conn_started
+            if self.stop_event.is_set():
+                logger.info("用户主动停止，断开连接")
+                disconnected_event.set()
+                return
+            elapsed = (time.time() - conn_started) if conn_started else 0
+            hb_ago = (time.time() - last_heartbeat_time) if last_heartbeat_time else None
+            hb_ago_txt = f"{hb_ago:.0f}s" if hb_ago is not None else "从未收到"
+            logger.warning(f"Disconnected callback called! 连接时长: {elapsed:.0f}s, 距最后心跳: {hb_ago_txt}, "
+                           f"累计心跳: {heartbeat_count} 次, 进入自动重连...")
+            push_js("window.getConnectInfo('reconnecting')")
             disconnected_event.set()
 
         logger.info("connecting to device...")
-        async with BleakClient(device, disconnected_callback=disconnected_callback,
-                               winrt=dict(use_cached_services=False)) as client:
-            logger.info("Connected")
-            # list = client.get_services()
-            list = client.services.services.values()
-            for service in list:
-                t_uuid = service.uuid
-                characteristics = service.characteristics
-                charList = []
-                for characteristic in characteristics:
-                    tempUuid = characteristic.uuid
-                    tempDesc = characteristic.description
-                    tempServiceUuid = characteristic.service_uuid
-                    charList.append({'tempUuid': tempUuid, 'tempDesc': tempDesc, 'tempServiceUuid': tempServiceUuid})
-                description = service.description
-                logger.info('----> description: %s, uuid: %s, characteristics: %s' % (description, t_uuid, charList))
+        try:
+            connect_start = time.time()
+            async with BleakClient(device, disconnected_callback=disconnected_callback,
+                                   winrt=dict(use_cached_services=False)) as client:
+                self.client = client
+                conn_started = time.time()
+                logger.info(f"Connected（建立连接耗时 {conn_started - connect_start:.1f}s）")
+                # 枚举服务，并顺带确认是否支持电量特征（用于保活）
+                battery_uuid = None
+                for service in client.services.services.values():
+                    t_uuid = service.uuid
+                    characteristics = service.characteristics
+                    charList = []
+                    for characteristic in characteristics:
+                        tempUuid = characteristic.uuid
+                        tempDesc = characteristic.description
+                        tempServiceUuid = characteristic.service_uuid
+                        charList.append({'tempUuid': tempUuid, 'tempDesc': tempDesc, 'tempServiceUuid': tempServiceUuid})
+                        if tempUuid == battery_characteristic:
+                            battery_uuid = tempUuid
+                    description = service.description
+                    logger.info('----> description: %s, uuid: %s, characteristics: %s' % (description, t_uuid, charList))
 
-            await client.start_notify(uuid, notification_handler)
-            # 蓝牙连接成功将信息返回给前端
-            # 调用Js函数传参时必须要先声明变量再传参，直接传会报错
-            info = 'true'
-            view.page().runJavaScript("window.getConnectInfo('%s')" % info)
+                notify_start = time.time()
+                await client.start_notify(uuid, notification_handler)
+                logger.info(f"start_notify 完成（耗时 {time.time() - notify_start:.1f}s）")
+                # 通知前端：首次连接成功 / 自动重连成功
+                if self.ever_connected:
+                    push_js("window.getConnectInfo('reconnected')")
+                else:
+                    self.ever_connected = True
+                    push_js("window.getConnectInfo('true')")
 
-            # value1 = await client.read_gatt_char(uuid)
-            # print('value',value)
-            await disconnected_event.wait()  # 休眠直到设备断开连接，有延迟。此处为监听设备直到断开为止
-            # await asyncio.sleep(10.0)           #程序监听的时间，此处为10秒
-            # await client.stop_notify(par_notification_characteristic)
+                # 保活：周期读取电量特征维持链路活跃，读失败则主动断开触发重连
+                keepalive_task = None
+                if battery_uuid is not None:
+                    keepalive_task = asyncio.ensure_future(self.keepalive(client, battery_uuid))
+
+                # 等待：设备断开 / 用户主动停止（监听直到断开为止，有延迟）
+                stop_waiter = asyncio.ensure_future(self._wait_stop())
+                done, pending = await asyncio.wait(
+                    {asyncio.ensure_future(disconnected_event.wait()), stop_waiter},
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                if keepalive_task is not None:
+                    keepalive_task.cancel()
+                return time.time() - conn_started  # 返回本次连接时长（秒）
+        except Exception as e:
+            logger.error(f"连接过程异常: {e}")
+            return None
+
+    async def keepalive(self, client, battery_uuid, interval=60):
+        """周期读取电量特征保活；读取超时/失败说明链路已失效，主动断开以触发自动重连"""
+        while not self.stop_event.is_set():
+            await asyncio.sleep(interval)
+            try:
+                data = await asyncio.wait_for(client.read_gatt_char(battery_uuid), timeout=10)
+                battery = data[0] if data else -1
+                logger.info(f"保活: 读取电量成功 = {battery}%")
+            except asyncio.TimeoutError:
+                logger.warning("保活读取超时，链路可能已失效，主动断开以触发重连")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                logger.warning(f"保活读取失败: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return
 
 
 # https://blog.csdn.net/hp_cpp/article/details/83040162 强行停止python子线程最佳方案
@@ -494,6 +648,9 @@ if __name__ == '__main__':
 
     channel = QWebChannel()
     handler = CallHandler()  # 实例化QWebChannel的前端处理对象
+    # 子线程推送的 JS 通过信号在 GUI 线程执行（跨线程调用 runJavaScript 不安全）
+    handler.js_notify.connect(lambda script: view.page().runJavaScript(script))
+    js_handler = handler
     channel.registerObject('PyHandler', handler)  # 将前端处理对象在前端页面中注册为名PyHandler对象，此对象在前端访问时名称即为PyHandler'
     view.page().setWebChannel(channel)  # 挂载前端处理对象
     url_string = urllib.request.pathname2url(os.path.join(os.getcwd(), "./web/index.html"))  # 加载本地html文件

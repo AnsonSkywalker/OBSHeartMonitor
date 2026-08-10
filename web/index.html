@@ -519,6 +519,18 @@
                     });
                     app.$data.visibleConnect = 'none';
                     app.$data.visibleStopConnect = '';
+                } else if ('reconnecting' === info) {
+                    app.$notify.warning({
+                        title: 'warning',
+                        message: '蓝牙连接已断开，正在自动重连...'
+                    });
+                } else if ('reconnected' === info) {
+                    app.$notify.success({
+                        title: 'success',
+                        message: '蓝牙已自动重连成功！'
+                    });
+                    app.$data.visibleConnect = 'none';
+                    app.$data.visibleStopConnect = '';
                 } else if ('false' === info) {
                     app.$alert('蓝牙设备连接失败，请重新连接！', '警告', {
                         confirmButtonText: '确定',
