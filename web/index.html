@@ -532,7 +532,7 @@
                     app.$data.visibleConnect = 'none';
                     app.$data.visibleStopConnect = '';
                 } else if ('false' === info) {
-                    app.$alert('蓝牙设备连接失败，请重新连接！', '警告', {
+                    app.$alert('未找到蓝牙设备，请确认手环已开启蓝牙且「心率广播」功能开启后重试！', '警告', {
                         confirmButtonText: '确定',
                     });
                 }

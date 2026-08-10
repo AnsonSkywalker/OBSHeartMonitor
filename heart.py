@@ -19,6 +19,7 @@ from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 
 import asyncio
+import json
 import time
 import wmi
 
@@ -132,12 +133,24 @@ async def notification_handler(characteristic: BleakGATTCharacteristic, data: by
     #
     #     1.\x06 对应的十进制值是 6。 暂时不知道这个值有啥用
     #     2.\x54 对应的十进制值是 84。  心跳的值， T 的ascii 的十六进制是54
-    raw = data.hex()
-    marker = raw.find('06')
-    if marker == -1 or marker + 2 >= len(raw):
-        logger.warning(f"无法解析的心跳数据: {raw}")
+    # 参考 HeartRateMonitor 仓库的标准 BLE 心率解析（替代原 split('06') hack）：
+    # byte[0] = Flags；bit0=1 → 16bit little-endian（byte[1:3]），bit0=0 → 8bit（byte[1]）
+    # 小米手环 flags=0x06（8bit + sensor contact），扩展字节（RR 间隔等）被忽略
+    if len(data) < 2:
+        logger.warning(f"心率数据过短: {data.hex()}")
         return None
-    value = int(raw[marker + 2:], 16)
+    flags = data[0]
+    if flags & 0x01:
+        if len(data) < 3:
+            logger.warning(f"16bit 心率数据缺少字节: {data.hex()}")
+            return None
+        value = int.from_bytes(data[1:3], 'little')
+    else:
+        value = data[1]
+    if value < 20 or value > 250:
+        # 超出合理心率范围，丢弃（防止错误数据污染 UI/统计）
+        logger.warning(f"心率值超出合理范围: {value}（原始数据: {data.hex()}）")
+        return None
     cache.set('value', value)
     maxValue = cache.get('maxValue')
     minValue = cache.get('minValue')
@@ -408,6 +421,8 @@ class myThread(threading.Thread):
     connect_timeout = 15          # 建立 BLE 连接的超时（秒）
     keepalive_interval = 60       # 保活读取间隔（秒）
     keepalive_read_timeout = 10   # 保活读取超时（秒）
+    min_stable_seconds = 60       # 连接维持超过该时长才算“正常掉线”，否则按短命连接退避
+    first_reconnect_delay = 10    # 正常掉线后的首次重连等待（秒），给设备/栈恢复时间
 
     def __init__(self, threadID, name, delay, bluetoothAdresss, uuid):
         threading.Thread.__init__(self, daemon=True)
@@ -432,7 +447,7 @@ class myThread(threading.Thread):
             self.loop = None
 
     async def startConnect(self, device_address, uuid):
-        reconnect_delay = 1  # 断连后的首次重连等待（秒），之后按 2、4、8... 退避，封顶 30s
+        reconnect_delay = self.first_reconnect_delay  # 断连后的首次重连等待（秒），之后按 2 倍退避，封顶 30s
         attempt = 0  # 本次会话累计的连接尝试次数（含首次）
         while not self.stop_event.is_set():
             attempt += 1
@@ -440,13 +455,14 @@ class myThread(threading.Thread):
             conn_seconds = await self.connectOnce(device_address, uuid)
             if self.stop_event.is_set():
                 break
-            if conn_seconds is not None and conn_seconds >= 10:
-                # 正常使用中掉线：重置退避，尽快重连
-                reconnect_delay = 1
+            if conn_seconds is not None and conn_seconds >= self.min_stable_seconds:
+                # 正常使用中掉线：重置退避，稍候重连
+                reconnect_delay = self.first_reconnect_delay
                 logger.warning(f"蓝牙连接已断开，{reconnect_delay}s 后尝试自动重连...")
             elif conn_seconds is not None:
-                # 刚连上就掉：视为不稳定，按退避递增重试，避免反复轰炸
-                logger.warning(f"连接仅维持 {conn_seconds:.0f}s 即断开，{reconnect_delay}s 后重试...")
+                # 刚连上就掉：视为不稳定（可能是设备端策略/低功耗），按退避递增重试，避免反复轰炸
+                logger.warning(f"连接仅维持 {conn_seconds:.0f}s 即断开（低于稳定阈值 {self.min_stable_seconds}s），"
+                               f"{reconnect_delay}s 后重试...")
             else:
                 logger.warning(f"蓝牙连接失败，{reconnect_delay}s 后重试...")
             # 等待退避间隔；用户主动停止时会立刻唤醒退出
@@ -480,7 +496,9 @@ class myThread(threading.Thread):
             return None
         scan_cost = time.time() - scan_start
         if device is None:
-            logger.error(f"could not find device with address '{device_address}'（扫描耗时 {scan_cost:.1f}s）")
+            # 手环的心率广播开关同时控制其 BLE advertising：关闭后扫描将完全找不到设备
+            logger.error(f"could not find device with address '{device_address}'（扫描耗时 {scan_cost:.1f}s）。"
+                         f"若持续找不到，请确认手环蓝牙已开启且「心率广播」功能处于开启状态")
             if not self.ever_connected:
                 push_js("window.getConnectInfo('false')")
             return None
@@ -515,9 +533,9 @@ class myThread(threading.Thread):
             return None
         connect_start = time.time()
         try:
-            # 重连时使用 Windows 缓存的服务列表，跳过重新发现以加快重连、减少失败点
+            # 完整服务发现：不使用 Windows 缓存服务（实测重连用缓存可能出现 45s 后断开，先排除该变量）
             client = BleakClient(device, disconnected_callback=disconnected_callback,
-                                 winrt=dict(use_cached_services=self.ever_connected))
+                                 winrt=dict(use_cached_services=False))
         except Exception as e:
             logger.error(f"创建 BleakClient 失败: {type(e).__name__}: {e}")
             return None

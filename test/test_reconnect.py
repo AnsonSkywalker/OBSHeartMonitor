@@ -100,6 +100,7 @@ class ReconnectTest(unittest.TestCase):
 
     def _start_thread(self, **kwargs):
         t = heart.myThread(1, "T", 0, FAKE_MAC, HEART_UUID)
+        t.first_reconnect_delay = 1  # 测试中加快首次重连，避免拖慢
         for k, v in kwargs.items():
             setattr(t, k, v)
         t.start()
@@ -114,20 +115,46 @@ class ReconnectTest(unittest.TestCase):
         return False
 
     def test_heartbeat_stats(self):
-        """心跳通知应更新计数与最后心跳时间"""
+        """8bit 心率格式（flags=0x06）应正确解析并更新统计"""
         async def feed(n):
             for _ in range(n):
                 await heart.notification_handler(mock.MagicMock(), bytearray(b"\x06\x54"))
         asyncio.run(feed(3))
-        self.assertEqual(heart.heartbeat_count, 3)
+        self.assertEqual(heart.heartbeat_count, 3)  # 0x54 = 84，在合理范围
         self.assertIsNotNone(heart.last_heartbeat_time)
+        self.assertEqual(heart.cache.set.call_args_list[0][0][1], 84)
+
+    def test_heartbeat_16bit_format(self):
+        """16bit little-endian 心率格式（flags bit0=1）应正确解析"""
+        async def feed():
+            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x07\x5a\x00"))  # 0x005a = 90
+        asyncio.run(feed())
+        self.assertEqual(heart.heartbeat_count, 1)
+        self.assertEqual(heart.cache.set.call_args_list[0][0][1], 90)
+
+    def test_heartbeat_16bit_short(self):
+        """16bit 格式但只有 2 字节（缺高字节）应拒绝"""
+        async def feed():
+            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x07\x5a"))
+        asyncio.run(feed())
+        self.assertEqual(heart.heartbeat_count, 0)
+
+    def test_heartbeat_with_extension_bytes(self):
+        """8bit 格式带扩展字节（如 RR 间隔）时只取心率字节"""
+        async def feed():
+            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x06\x54\x00\x00"))
+        asyncio.run(feed())
+        self.assertEqual(heart.heartbeat_count, 1)
+        self.assertEqual(heart.cache.set.call_args_list[0][0][1], 84)
 
     def test_heartbeat_bad_data(self):
-        """不含 0x06 前缀的异常心跳数据不应抛异常"""
+        """数据过短或心率值超合理范围不应计入统计"""
         async def feed():
-            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x00\x01"))
+            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x00\x01"))  # 心率 1，范围外
+            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x06"))       # 长度不足
+            await heart.notification_handler(mock.MagicMock(), bytearray(b"\x07\xff\xff"))  # 16bit 65535，范围外
         asyncio.run(feed())
-        self.assertEqual(heart.heartbeat_count, 0)  # 未计入统计
+        self.assertEqual(heart.heartbeat_count, 0)  # 全部被拒绝
 
     def test_reconnect_flow(self):
         """断连后应自动重连并保持，用户停止后线程干净退出"""
