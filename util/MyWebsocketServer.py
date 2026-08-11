@@ -30,8 +30,11 @@ class MyWebsocketServer:
                     value = cache.get("value")
                     maxValue = cache.get('maxValue')
                     minValue = cache.get('minValue')
+                    # 心率倍率（由 heart.py 保存时写入；仅用于叠加层颜色换算，显示数值不变）
+                    heartRateMultiplier = cache.get("ratio", 1)
 
-                    heartInfo = {"value": value, "maxValue": maxValue, "minValue": minValue}
+                    heartInfo = {"value": value, "maxValue": maxValue, "minValue": minValue,
+                                 "heartRateMultiplier": heartRateMultiplier}
                     # print(heartInfo)
                     await websocket.send(json.dumps(heartInfo))
                     await asyncio.sleep(0.5)

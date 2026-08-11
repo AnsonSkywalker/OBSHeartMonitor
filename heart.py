@@ -45,6 +45,9 @@ device_address = ""
 # 蓝牙连接线程（模块级初始化，避免未连接时引用报错）
 thread1 = None
 
+# Web 服务线程（模块级初始化，避免未启动服务时停止引用报错）
+server = None
+
 # 前端JS执行通道：bluetooth/websocket 等子线程不能直接调用 Qt 的 runJavaScript，
 # 统一通过 CallHandler.js_notify 信号排队到 GUI 线程执行
 js_handler = None
@@ -292,15 +295,28 @@ class CallHandler(QObject):
     @pyqtSlot(str)
     def stopServer(self, port):
         logger.info('----- stopServer -----')
-        # myapp.exit()
-        try:
-            stop_thread(server)
-            # server.terminate()
-        except (SystemExit, Exception) as e:
-            logger.error(f"An error occurred: {e}")
-        # server.terminate()
-        info = 'true'
-        view.page().runJavaScript("window.stopServer('%s')" % info)
+        # 停止流程放后台线程执行：优雅关闭 uvicorn 需要 join 等待（最坏几秒），
+        # 避免阻塞 GUI 线程导致前端无响应；通知走 push_js 信号回 GUI 线程
+        def _do_stop():
+            global server
+            t = server  # 快照：等待期间用户可能重新启动服务，避免误停新线程
+            try:
+                if t is not None and t.is_alive():
+                    # 温和关闭：置位 uvicorn 的 should_exit，让它自己关监听、跑完
+                    # lifespan shutdown 后退出线程，避免 stop_thread 注入 SystemExit
+                    # 打断 asyncio 事件循环（旧方式会在日志里留下一大串 traceback）
+                    fastApi.stop()
+                    t.join(timeout=5)
+                    if t.is_alive():
+                        logger.warning("uvicorn 未在 5s 内优雅退出，强制停止线程")
+                        stop_thread(t)
+                else:
+                    logger.info("web 服务未在运行，无需停止")
+            except Exception as e:
+                logger.error(f"stopServer An error occurred: {e}")
+            push_js("window.stopServer('true')")
+
+        threading.Thread(target=_do_stop, daemon=True).start()
 
     # 调用js代码，将搜索到的蓝牙信息返回给前端
     @pyqtSlot(str)
@@ -328,6 +344,33 @@ class CallHandler(QObject):
         else:
             info = 'true'
             view.page().runJavaScript("window.onSubmitConfig('%s')" % info)
+
+    @pyqtSlot(str)
+    def saveHeartRateMultiplier(self, str_args):
+        """保存心率倍率档位（白名单校验在 fastApi.save_config 中），
+        并写入 cache 供 WebSocket 推送，让已打开的 OBS 叠加层即时变色。"""
+        try:
+            ratio = float(str_args)
+            value = fastApi.save_config({"heartRateMultiplier": ratio})
+        except Exception as e:
+            logger.error(f"saveHeartRateMultiplier An error occurred: {e}")
+            push_js("window.onHeartRateMultiplierSaved('false')")
+            return
+        cache.set('ratio', value)
+        logger.info(f"心率倍率已保存: {value}")
+        push_js("window.onHeartRateMultiplierSaved('true')")
+
+    @pyqtSlot(str)
+    def getHeartRateMultiplier(self, str_args):
+        """读取当前心率倍率档位并回推前端（主界面为 file:// 页面，
+        无法跨源 fetch /config，故经 QWebChannel 取）。"""
+        try:
+            m = fastApi.load_config().get("heartRateMultiplier")
+            ratio = m if (not isinstance(m, bool) and m in (1, 1.25, 2)) else 1
+        except Exception as e:
+            logger.error(f"getHeartRateMultiplier An error occurred: {e}")
+            ratio = 1
+        push_js(f"window.onHeartRateMultiplierLoaded('{ratio}')")
 
     @pyqtSlot(str)
     def onBackConfig(self):
@@ -728,6 +771,8 @@ if __name__ == '__main__':
     cache.set('value', 0)
     cache.set('maxValue', 0)
     cache.set('minValue', 0)
+    # 心率倍率默认 1（原始模式），供 OBS 叠加层 WebSocket 推送使用
+    cache.set('ratio', 1)
     getSystemInfo()
 
     webSocketServer = MyWebsocketServer("localhost", 8000)

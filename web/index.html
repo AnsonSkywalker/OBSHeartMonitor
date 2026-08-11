@@ -133,6 +133,18 @@
                                 </div>
                             </el-form-item>
 
+                            <el-form-item label="心率倍率">
+                                <el-radio-group v-model="heartRateMultiplier" @change="saveHeartRateMultiplier">
+                                    <el-radio :label="1">原始模式（1x）</el-radio>
+                                    <el-radio :label="1.25">有氧模式（1.25x）</el-radio>
+                                    <el-radio :label="2">静息模式（2x）</el-radio>
+                                </el-radio-group>
+                                <div style="font-size: 12px; color: #909399; line-height: 1.6; margin-top: 4px;">
+                                    仅影响 OBS 叠加层心率数字的颜色（把实际心率乘倍率后作为颜色档位依据），
+                                    叠加层显示的心率数值仍为真实值；切换后已打开的叠加层实时变色。
+                                </div>
+                            </el-form-item>
+
                             <el-form-item>
 
                             </el-form-item>
@@ -197,6 +209,7 @@
             formConfig: {
                 uuid: "00002a37-0000-1000-8000-00805f9b34fb",
             },
+            heartRateMultiplier: 1, // 心率倍率档位：1 原始 / 1.25 有氧 / 2 静息（仅影响 OBS 叠加层颜色）
             activeName: 'first',
             searchLoading: false,
             connectLoading: false,
@@ -324,6 +337,14 @@
                 setTimeout(() => {
                     window.PyHandler.stopServer('');
                 }, 2000)
+            },
+            // 保存心率倍率档位（仅影响 OBS 叠加层颜色，显示数值不变）
+            saveHeartRateMultiplier() {
+                window.PyHandler.saveHeartRateMultiplier(String(this.heartRateMultiplier));
+            },
+            // 读取已保存的心率倍率档位（file:// 页面无法跨源 fetch /config，走 QWebChannel）
+            loadHeartRateMultiplier() {
+                window.PyHandler.getHeartRateMultiplier('');
             },
             handleSelectionChange(val) {
                 this.multipleSelection = val;
@@ -487,6 +508,7 @@
             setTimeout(() => {
                 this.getConfig();
                 this.drawChart();
+                this.loadHeartRateMultiplier();
             }, 500)
 
             //this.drawChart();
@@ -627,6 +649,29 @@
                 console.log('data:', data)
                 if (data !== undefined && data !== null && data !== '') {
                     app.$data.form.port = data
+                }
+            }
+
+            // 心率倍率读取回调（python 端读取配置后回推）
+            window.onHeartRateMultiplierLoaded = function (ratio) {
+                let v = parseFloat(ratio);
+                if ([1, 1.25, 2].indexOf(v) >= 0) {
+                    app.$data.heartRateMultiplier = v;
+                }
+            }
+
+            // 心率倍率保存回调
+            window.onHeartRateMultiplierSaved = function (info) {
+                if ('true' === info) {
+                    app.$notify.success({
+                        title: 'success',
+                        message: '心率倍率已保存，OBS 叠加层颜色即时生效！'
+                    });
+                } else {
+                    app.$notify.error({
+                        title: 'error',
+                        message: '心率倍率保存失败！'
+                    });
                 }
             }
 

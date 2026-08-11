@@ -78,6 +78,8 @@
     }
 
     // 根据心率值(次/分)与最大心率计算渐变颜色
+    // 注意：此处收到的是“颜色用等效心率”= 真实心率 × 倍率（由 heartRateMultiplier 提供），
+    // 仅用于颜色档位换算；页面显示的数字始终是真实心率值
     function colorForHeartRate(value, maxHeartRate) {
         const stops = HEART_RATE_ZONE_STOPS;
         const percent = value / maxHeartRate * 100;
@@ -98,6 +100,7 @@
         data: {
             heartNum: null,      // 当前心率（null = 尚未收到有效数据）
             maxHeartRate: 180,   // 最大心率（默认 180；由 /config 本地私有配置覆盖）
+            heartRateMultiplier: 1,  // 颜色倍率（1x 原始 / 1.25x 有氧 / 2x 静息），仅影响颜色
             ws: null,
             reconnectTimer: null,
             destroyed: false,    // 页面卸载标记，防止卸载后重建重连
@@ -108,7 +111,9 @@
             },
             heartColor: function () {
                 if (this.heartNum === null) return '#9E9E9E';  // 无数据时灰色
-                return colorForHeartRate(this.heartNum, this.maxHeartRate);
+                // 倍率仅参与颜色换算：等效心率 = 真实心率 × 倍率，显示数值仍为真实心率
+                const effective = this.heartNum * this.heartRateMultiplier;
+                return colorForHeartRate(effective, this.maxHeartRate);
             },
         },
         methods: {
@@ -136,6 +141,11 @@
                     if (result && typeof result.value === 'number') {
                         that.heartNum = result.value > 0 ? result.value : null;
                     }
+                    // 倍率变化实时同步（主界面改档位后无需刷新 OBS 浏览器源）
+                    if (result && typeof result.heartRateMultiplier === 'number'
+                            && result.heartRateMultiplier > 0) {
+                        that.heartRateMultiplier = result.heartRateMultiplier;
+                    }
                 };
 
                 this.ws.onclose = function () {
@@ -159,16 +169,20 @@
         },
         mounted: function () {
             const that = this;
-            // 读取最大心率本地私有配置（/config 由 fastApi.py 提供）；
-            // 缺失或异常时保持默认值 180
+            // 读取最大心率与颜色倍率本地私有配置（/config 由 fastApi.py 提供）；
+            // 缺失或异常时保持默认值 180 / 1
             fetch('/config')
                 .then(function (res) { return res.json(); })
                 .then(function (cfg) {
                     if (cfg && typeof cfg.maxHeartRate === 'number' && cfg.maxHeartRate > 0) {
                         that.maxHeartRate = cfg.maxHeartRate;
                     }
+                    if (cfg && typeof cfg.heartRateMultiplier === 'number'
+                            && cfg.heartRateMultiplier > 0) {
+                        that.heartRateMultiplier = cfg.heartRateMultiplier;
+                    }
                 })
-                .catch(function () { /* 保持默认 180 */ });
+                .catch(function () { /* 保持默认 180 / 1 */ });
             this.connectWebSocketServer();
         },
     });
