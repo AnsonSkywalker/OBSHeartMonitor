@@ -35,6 +35,9 @@ templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 # 1x 原始模式（默认）/ 1.25x 有氧模式 / 2x 静息模式
 HEART_RATE_MULTIPLIERS = (1, 1.25, 2)
 
+# 允许写入配置的本机来源（同源页面；跨源请求拒绝）
+_LOCAL_ORIGINS = ("http://127.0.0.1", "http://localhost")
+
 
 def load_config():
     """读取 local_config.json，返回 dict；文件缺失/损坏时返回空 dict。"""
@@ -100,7 +103,15 @@ async def get_config():
 
 @app.post("/config")
 async def update_config(request: Request):
-    """同源写入心率倍率（供 OBS 叠加层/调试使用；主界面走 QWebChannel）。"""
+    """同源写入心率倍率（供 OBS 叠加层/调试使用；主界面走 QWebChannel）。
+
+    带 Origin 的跨源请求一律拒绝：本机恶意网页可用 text/plain 简单请求绕过
+    CORS 预检向 127.0.0.1 发 POST，虽然白名单把影响限制在三档倍率，仍应防御。
+    无 Origin 的请求（curl/脚本调试）放行，保持开发便利。
+    """
+    origin = request.headers.get("origin")
+    if origin and not origin.startswith(_LOCAL_ORIGINS):
+        return JSONResponse({"ok": False, "error": "跨源请求被拒绝"}, status_code=403)
     try:
         data = await request.json()
     except Exception:
@@ -140,9 +151,11 @@ class InterceptHandler(logging.Handler):
 
 
 
-def start(port):
+def prepare(port):
+    """创建并返回 uvicorn.Server 实例（同时接管 uvicorn 日志），不阻塞。
+    供 myServer 线程保存实例引用，停止时可按实例精确停止。"""
     global config
-    config= uvicorn.Config("fastApi:app", host='127.0.0.1', port=port, reload=False)
+    config = uvicorn.Config("fastApi:app", host='127.0.0.1', port=port, reload=False)
     # config = uvicorn.Config("fastApi:app", host='0.0.0.0', port=port, reload=False)
     global webServer
     webServer = uvicorn.Server(config)
@@ -155,24 +168,39 @@ def start(port):
     for logger_name in LOGGER_NAMES:
         logging_logger = logging.getLogger(logger_name)
         logging_logger.handlers = [InterceptHandler()]
+    return webServer
 
+
+def serve():
+    """阻塞运行由 prepare 创建的 uvicorn 服务（线程内调用）。"""
+    global webServer
     webServer.run()
     # uvicorn.run(app="fastApi:app", host="127.0.0.1", port=port, reload=False)
 
 
-def stop():
+def start(port):
+    """兼容入口：prepare + serve（阻塞），等价于旧的 start。"""
+    prepare(port)
+    serve()
+
+
+def stop(target=None):
     """优雅停止 uvicorn：置位 should_exit，由 uvicorn 主循环自行关闭监听并
     跑完 lifespan shutdown，而不是向线程注入异常强杀。
+    传入 target（uvicorn.Server 实例）时精确停止该实例——避免停止流程运行
+    期间用户重新启动服务时，误停新实例；缺省时停止全局 webServer。
     返回是否已发出停止请求。"""
-    # 启动线程可能尚未执行到 webServer = uvicorn.Server(...)（点启动后立刻点停止），
-    # 短暂等待避免读到未定义的全局变量
-    server = globals().get("webServer")
+    server = target
     if server is None:
-        for _ in range(10):
-            time.sleep(0.1)
-            server = globals().get("webServer")
-            if server is not None:
-                break
+        # 启动线程可能尚未执行到 webServer = uvicorn.Server(...)（点启动后立刻点停止），
+        # 短暂等待避免读到未定义的全局变量
+        server = globals().get("webServer")
+        if server is None:
+            for _ in range(10):
+                time.sleep(0.1)
+                server = globals().get("webServer")
+                if server is not None:
+                    break
     if server is None:
         return False
     # 只置位 should_exit：uvicorn 会走完 lifespan shutdown（发 shutdown 事件并等

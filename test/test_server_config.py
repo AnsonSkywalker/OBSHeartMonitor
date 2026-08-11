@@ -9,6 +9,7 @@ heart.py 心率倍率 slot 与 stopServer 后台化。
 import asyncio
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -20,10 +21,14 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
+import websockets
+from diskcache import Cache
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import fastApi  # noqa: E402
 import heart  # noqa: E402
+import util.MyWebsocketServer as ws_mod  # noqa: E402
 
 
 def free_port():
@@ -64,7 +69,8 @@ class ConfigFileTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self._cfg + ".tmp"))
 
     def test_invalid_values_rejected(self):
-        for bad in (3, 0, -1, "1.25", None, True):
+        for bad in (3, 0, -1, "1.25", None, True,
+                    float("nan"), float("inf"), float("-inf")):
             with self.assertRaises(ValueError, msg=f"应拒绝 {bad!r}"):
                 fastApi.save_config({"heartRateMultiplier": bad})
         # 拒绝后原配置未被破坏
@@ -83,6 +89,18 @@ class ConfigFileTest(unittest.TestCase):
         """从未启动服务时 stop() 应返回 False 且不抛错。"""
         fastApi.__dict__.pop("webServer", None)
         self.assertIs(fastApi.stop(), False)
+
+    def test_stop_target_precision(self):
+        """stop(target) 应只置位目标实例，不触碰全局 webServer（停止期间重启不误停）。"""
+        fastApi.__dict__.pop("webServer", None)
+        old = fastApi.prepare(8766)  # 旧实例：停止流程的目标
+        new = fastApi.prepare(8767)  # 新实例：用户停止期间重启的服务
+        self.assertIs(fastApi.stop(old), True)
+        self.assertTrue(old.should_exit, "目标实例应被置位 should_exit")
+        self.assertFalse(new.should_exit, "新实例不应被误停")
+        # 无 target 时仍作用于全局 webServer（当前为新实例）
+        self.assertIs(fastApi.stop(), True)
+        self.assertTrue(new.should_exit)
 
 
 class UvicornGracefulStopTest(unittest.TestCase):
@@ -135,6 +153,15 @@ class UvicornGracefulStopTest(unittest.TestCase):
                 headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=5) as r:
                 self.assertEqual(r.status, 200)
+            # 带跨源 Origin 的请求应被拒绝（模拟本机恶意网页绕过 CORS 预检）
+            req = urllib.request.Request(
+                base + "/config",
+                data=json.dumps({"heartRateMultiplier": 1.25}).encode("utf-8"),
+                headers={"Content-Type": "text/plain", "Origin": "http://evil.example"},
+                method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(cm.exception.code, 403)
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 urllib.request.urlopen(urllib.request.Request(
                     base + "/config",
@@ -198,10 +225,11 @@ class StopServerThreadTest(unittest.TestCase):
     """stopServer 后台化：不阻塞调用方、优雅路径不强杀、超时兜底强杀。"""
 
     class FakeServerThread:
-        def __init__(self, hang=False):
+        def __init__(self, hang=False, uvicorn_server=None):
             self.hang = hang
             self.joined = False
             self._alive = True
+            self.uvicorn_server = uvicorn_server
 
         def is_alive(self):
             return self._alive
@@ -236,9 +264,20 @@ class StopServerThreadTest(unittest.TestCase):
             elapsed = time.time() - t0
             self.assertLess(elapsed, 0.2, "stopServer 不应阻塞调用方")
             self._wait_pushes(self.pushes)
-        mock_stop.assert_called_once_with()
+        mock_stop.assert_called_once_with(None)  # 线程未保存 uvicorn 引用时用全局
         self.assertTrue(fake.joined)
         mock_stop_thread.assert_not_called()  # 优雅路径不强杀
+        self.assertIn("window.stopServer('true')", self.pushes)
+
+    def test_graceful_stop_target_instance(self):
+        """线程保存了 uvicorn 实例引用时，应精确停止该实例而非全局。"""
+        fake_server = mock.MagicMock()
+        fake = self.FakeServerThread(uvicorn_server=fake_server)
+        heart.server = fake
+        with mock.patch.object(fastApi, "stop") as mock_stop:
+            self.handler.stopServer("")
+            self._wait_pushes(self.pushes)
+        mock_stop.assert_called_once_with(fake_server)
         self.assertIn("window.stopServer('true')", self.pushes)
 
     def test_hang_forced_stop(self):
@@ -256,6 +295,89 @@ class StopServerThreadTest(unittest.TestCase):
         self.handler.stopServer("")
         self._wait_pushes(self.pushes)
         self.assertIn("window.stopServer('true')", self.pushes)
+
+
+class WebsocketPushTest(unittest.TestCase):
+    """WebSocket 推送集成：真实连接验证推送包含 heartRateMultiplier 字段。"""
+
+    def _run_server(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        start_server = websockets.serve(self._handle, "127.0.0.1", self.port)
+        self.server_ref["server"] = loop.run_until_complete(start_server)
+        self.server_ref["loop"] = loop
+        loop.run_forever()
+
+    async def _handle(self, websocket):
+        server = ws_mod.MyWebsocketServer("127.0.0.1", self.port)
+        await server.echo(websocket)
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cache = Cache(os.path.join(self.tmpdir, "cache"))
+        self.cache.set("value", 80)
+        self.cache.set("maxValue", 120)
+        self.cache.set("minValue", 60)
+        self.cache.set("ratio", 1.25)
+        self._orig_cache = ws_mod.cache
+        ws_mod.cache = self.cache
+        self.port = free_port()
+        self.server_ref = {}
+        self.thread = threading.Thread(target=self._run_server, daemon=True)
+        self.thread.start()
+        # 等待端口就绪
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=1):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("WebSocket 服务未就绪")
+
+    def tearDown(self):
+        loop = self.server_ref.get("loop")
+        server = self.server_ref.get("server")
+        if loop is not None:
+            async def _shutdown():
+                if server is not None:
+                    server.close()
+                    await server.wait_closed()
+                loop.stop()
+
+            loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_shutdown()))
+            self.thread.join(timeout=5)
+        ws_mod.cache = self._orig_cache
+        self.cache.close()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_push_contains_multiplier(self):
+        """推送的 JSON 应包含 value/maxValue/minValue/heartRateMultiplier。"""
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{self.port}") as ws:
+                await ws.send("heart-overlay")
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                return json.loads(raw)
+
+        info = asyncio.run(client())
+        self.assertEqual(info["value"], 80)
+        self.assertEqual(info["maxValue"], 120)
+        self.assertEqual(info["minValue"], 60)
+        self.assertEqual(info["heartRateMultiplier"], 1.25)
+
+    def test_push_default_multiplier(self):
+        """cache 无倍率时推送默认 1（与叠加层默认值一致）。"""
+        self.cache.delete("ratio")
+
+        async def client():
+            async with websockets.connect(f"ws://127.0.0.1:{self.port}") as ws:
+                await ws.send("heart-overlay")
+                raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                return json.loads(raw)
+
+        info = asyncio.run(client())
+        self.assertEqual(info["heartRateMultiplier"], 1)
 
 
 if __name__ == "__main__":

@@ -304,8 +304,9 @@ class CallHandler(QObject):
                 if t is not None and t.is_alive():
                     # 温和关闭：置位 uvicorn 的 should_exit，让它自己关监听、跑完
                     # lifespan shutdown 后退出线程，避免 stop_thread 注入 SystemExit
-                    # 打断 asyncio 事件循环（旧方式会在日志里留下一大串 traceback）
-                    fastApi.stop()
+                    # 打断 asyncio 事件循环（旧方式会在日志里留下一大串 traceback）；
+                    # 精确停止本线程对应的 uvicorn 实例，防止期间重启的新服务被误停
+                    fastApi.stop(getattr(t, "uvicorn_server", None))
                     t.join(timeout=5)
                     if t.is_alive():
                         logger.warning("uvicorn 未在 5s 内优雅退出，强制停止线程")
@@ -352,11 +353,13 @@ class CallHandler(QObject):
         try:
             ratio = float(str_args)
             value = fastApi.save_config({"heartRateMultiplier": ratio})
+            # 写盘与写 cache 同属保存流程：任一失败都回推 false，
+            # 避免配置已改但推送未更新的不一致状态
+            cache.set('ratio', value)
         except Exception as e:
             logger.error(f"saveHeartRateMultiplier An error occurred: {e}")
             push_js("window.onHeartRateMultiplierSaved('false')")
             return
-        cache.set('ratio', value)
         logger.info(f"心率倍率已保存: {value}")
         push_js("window.onHeartRateMultiplierSaved('true')")
 
@@ -725,7 +728,10 @@ class myServer(threading.Thread):
 
     def run(self):
         # myapp.main(self.port)
-        fastApi.start(int(self.port))
+        # 保存本线程的 uvicorn 实例引用：停止时按实例精确停止，
+        # 避免停止流程期间用户重启服务导致误停新实例
+        self.uvicorn_server = fastApi.prepare(int(self.port))
+        fastApi.serve()
 
     def terminate(self):
         pass
