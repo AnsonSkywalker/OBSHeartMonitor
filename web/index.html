@@ -553,6 +553,11 @@
                     });
                     app.$data.visibleConnect = 'none';
                     app.$data.visibleStopConnect = '';
+                } else if ('protecting' === info) {
+                    app.$notify.warning({
+                        title: 'warning',
+                        message: '设备可能处于重连保护期，已延长等待，将稍后自动重试...'
+                    });
                 } else if ('false' === info) {
                     app.$alert('未找到蓝牙设备，请确认手环已开启蓝牙且「心率广播」功能开启后重试！', '警告', {
                         confirmButtonText: '确定',

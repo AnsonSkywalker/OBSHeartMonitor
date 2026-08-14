@@ -29,9 +29,11 @@ class FakeBatteryService:
 
 
 class FakeClient:
-    """模拟 BleakClient：第一次连接建立后立即断连，后续连接保持稳定。"""
+    """模拟 BleakClient：前 short_lives 次连接建立后立即断连，后续连接保持稳定。"""
 
     total_notify = 0
+    short_lives = 1   # 前 N 次连接为短命连接（start_notify 后立即断开）
+    stable_then_drop = None  # 若为 (第N次连接, 秒数)：第 N 次连接维持该秒数后自动断开（模拟正常掉线）
     hang_connect = False   # True 时 connect() 永不完成，用于测连接超时
     hang_read = False      # True 时 read_gatt_char 永不完成，用于测保活超时
     include_battery = False
@@ -60,10 +62,16 @@ class FakeClient:
     async def __aexit__(self, *args):
         self._connected = False
 
+    async def _drop_after(self, seconds):
+        await asyncio.sleep(seconds)
+        self._cb(self)  # 在事件循环线程内触发断连回调
+
     async def start_notify(self, uuid, handler):
         FakeClient.total_notify += 1
-        if FakeClient.total_notify == 1:
-            self._cb(self)  # 第一次连接后立即断连，模拟不稳定
+        if FakeClient.total_notify <= FakeClient.short_lives:
+            self._cb(self)  # 前 short_lives 次连接后立即断连，模拟不稳定
+        elif FakeClient.stable_then_drop and FakeClient.total_notify == FakeClient.stable_then_drop[0]:
+            asyncio.create_task(self._drop_after(FakeClient.stable_then_drop[1]))
 
     async def disconnect(self):
         self._connected = False
@@ -86,6 +94,8 @@ class ReconnectTest(unittest.TestCase):
         heart.heartbeat_count = 0
         self.pushes = []
         FakeClient.total_notify = 0
+        FakeClient.short_lives = 1
+        FakeClient.stable_then_drop = None
         FakeClient.hang_connect = False
         FakeClient.hang_read = False
         FakeClient.include_battery = False
@@ -101,10 +111,29 @@ class ReconnectTest(unittest.TestCase):
     def _start_thread(self, **kwargs):
         t = heart.myThread(1, "T", 0, FAKE_MAC, HEART_UUID)
         t.first_reconnect_delay = 1  # 测试中加快首次重连，避免拖慢
+        t.short_conn_backoff = (1, 2, 3, 4)  # 测试中缩小短命连接退避阶梯
         for k, v in kwargs.items():
             setattr(t, k, v)
         t.start()
         return t
+
+    def _patch_wait_recorder(self):
+        """替换 _wait_stop：记录每次退避等待时长（不真实等待以加速测试）；
+        timeout 为 None 的调用（连接期间等待用户停止）保持原语义"""
+        waits = []
+        orig = heart.myThread._wait_stop
+
+        async def record_wait(self, timeout=None):
+            if timeout is None:
+                while not self.stop_event.is_set():
+                    await asyncio.sleep(0.05)
+                return True
+            waits.append(timeout)
+            await asyncio.sleep(0.05)
+            return False
+
+        heart.myThread._wait_stop = record_wait
+        return waits, orig
 
     def _wait_until(self, cond, timeout=20):
         deadline = time.time() + timeout
@@ -172,6 +201,7 @@ class ReconnectTest(unittest.TestCase):
         self.assertEqual(set(conn_pushes),
                          {"window.getConnectInfo('true')",
                           "window.getConnectInfo('reconnecting')",
+                          "window.getConnectInfo('protecting')",
                           "window.getConnectInfo('reconnected')"})
 
     def test_connect_timeout_then_reconnect(self):
@@ -229,6 +259,51 @@ class ReconnectTest(unittest.TestCase):
             "前端应收到断开通知")
         t.join(timeout=10)
         self.assertFalse(t.is_alive(), "断开后线程应退出")
+
+    def test_short_conn_backoff_escalation(self):
+        """连续短命连接应按阶梯逐级加大等待（测试中缩小为 1/2/3/4）"""
+        FakeClient.short_lives = 3  # 前 3 次连接均短命
+        waits, orig = self._patch_wait_recorder()
+        try:
+            t = self._start_thread()
+            self.assertTrue(self._wait_until(lambda: FakeClient.total_notify >= 4, timeout=20),
+                            "连续短命后应继续重连")
+            t.stop_event.set()
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive())
+        finally:
+            heart.myThread._wait_stop = orig
+        self.assertEqual(waits[:3], [1, 2, 3])
+        self.assertIn("window.getConnectInfo('protecting')", self.pushes)
+
+    def test_stable_reconnect_resets_streak(self):
+        """短命连接后若某次连接稳定（正常掉线），短命计数应重置，退避回到首次"""
+        FakeClient.short_lives = 1
+        FakeClient.stable_then_drop = (2, 0.5)  # 第 2 次连接维持 0.5s 后掉线
+        waits, orig = self._patch_wait_recorder()
+        try:
+            t = self._start_thread(short_conn_backoff=(5, 2, 3, 4), min_stable_seconds=0.3)
+            self.assertTrue(self._wait_until(lambda: FakeClient.total_notify >= 3, timeout=20),
+                            "正常掉线后应继续重连")
+            t.stop_event.set()
+            t.join(timeout=10)
+        finally:
+            heart.myThread._wait_stop = orig
+        # 第一次短命 wait=5；第二次稳定 0.5s（>= 阈值 0.3）属正常掉线，wait=first_reconnect_delay=1
+        self.assertEqual(waits[:2], [5, 1])
+
+    def test_fail_backoff_independent(self):
+        """连接失败（找不到设备）的退避保持独立 2 倍递增，不受短命阶梯影响"""
+        heart.BleakScanner.find_device_by_address = mock.AsyncMock(return_value=None)
+        waits, orig = self._patch_wait_recorder()
+        try:
+            t = self._start_thread(max_reconnect_delay=8)
+            self.assertTrue(self._wait_until(lambda: len(waits) >= 3, timeout=20))
+            t.stop_event.set()
+            t.join(timeout=10)
+        finally:
+            heart.myThread._wait_stop = orig
+        self.assertEqual(waits[:3], [1, 2, 4])  # first=1，封顶 8
 
     def test_disconnect_without_connection(self):
         """未连接蓝牙时点断开：不应崩溃，前端仍收到反馈"""

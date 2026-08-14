@@ -469,6 +469,10 @@ class myThread(threading.Thread):
     keepalive_read_timeout = 10   # 保活读取超时（秒）
     min_stable_seconds = 60       # 连接维持超过该时长才算“正常掉线”，否则按短命连接退避
     first_reconnect_delay = 10    # 正常掉线后的首次重连等待（秒），给设备/栈恢复时间
+    # 连续短命连接的退避阶梯（秒）。小米手环在频繁断连后会进入“重连保护期”
+    # （拒绝连接/暂停广播，实测约 90s）：逐级加大等待可避开保护期一击连稳，
+    # 避免固定短间隔重试在保护期内反复轰炸、反而延长设备侧的惩罚。
+    short_conn_backoff = (30, 120, 180, 300)   # 第 1/2/3 次及更多次短命连接后的等待时长
 
     def __init__(self, threadID, name, delay, bluetoothAdresss, uuid):
         threading.Thread.__init__(self, daemon=True)
@@ -493,7 +497,8 @@ class myThread(threading.Thread):
             self.loop = None
 
     async def startConnect(self, device_address, uuid):
-        reconnect_delay = self.first_reconnect_delay  # 断连后的首次重连等待（秒），之后按 2 倍退避，封顶 30s
+        fail_delay = self.first_reconnect_delay  # 连接失败（找不到/超时）的退避（秒），之后按 2 倍退避，封顶 30s
+        short_conn_streak = 0  # 连续短命连接次数（连上但未达稳定阈值即断）
         attempt = 0  # 本次会话累计的连接尝试次数（含首次）
         while not self.stop_event.is_set():
             attempt += 1
@@ -502,18 +507,26 @@ class myThread(threading.Thread):
             if self.stop_event.is_set():
                 break
             if conn_seconds is not None and conn_seconds >= self.min_stable_seconds:
-                # 正常使用中掉线：重置退避，稍候重连
-                reconnect_delay = self.first_reconnect_delay
-                logger.warning(f"蓝牙连接已断开，{reconnect_delay}s 后尝试自动重连...")
+                # 正常使用中掉线：设备行为正常，重置短命计数与失败退避，稍候重连
+                short_conn_streak = 0
+                fail_delay = self.first_reconnect_delay
+                wait = fail_delay
+                logger.warning(f"蓝牙连接已断开，{wait}s 后尝试自动重连...")
             elif conn_seconds is not None:
-                # 刚连上就掉：视为不稳定（可能是设备端策略/低功耗），按退避递增重试，避免反复轰炸
-                logger.warning(f"连接仅维持 {conn_seconds:.0f}s 即断开（低于稳定阈值 {self.min_stable_seconds}s），"
-                               f"{reconnect_delay}s 后重试...")
+                # 刚连上就掉：设备可能处于重连保护期，按阶梯加大等待，避免反复轰炸
+                short_conn_streak += 1
+                idx = min(short_conn_streak - 1, len(self.short_conn_backoff) - 1)
+                wait = self.short_conn_backoff[idx]
+                push_js("window.getConnectInfo('protecting')")
+                logger.warning(
+                    f"连接仅维持 {conn_seconds:.0f}s 即断开（低于稳定阈值 {self.min_stable_seconds}s，"
+                    f"第 {short_conn_streak} 次短命连接）。设备可能处于重连保护期，{wait}s 后重试...")
             else:
-                logger.warning(f"蓝牙连接失败，{reconnect_delay}s 后重试...")
+                wait = fail_delay
+                fail_delay = min(fail_delay * 2, self.max_reconnect_delay)
+                logger.warning(f"蓝牙连接失败，{wait}s 后重试...")
             # 等待退避间隔；用户主动停止时会立刻唤醒退出
-            await self._wait_stop(timeout=reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, self.max_reconnect_delay)
+            await self._wait_stop(timeout=wait)
         logger.info("蓝牙连接线程退出（用户停止或会话结束）")
 
     async def _wait_stop(self, timeout=None):
